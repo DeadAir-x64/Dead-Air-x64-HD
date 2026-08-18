@@ -368,6 +368,12 @@ function Get-Part($url, $dest, $expectSize) {
             $now = 0
             if (Test-Path $dest) { $now = (Get-Item $dest).Length }
             if ($now -ge $expectSize) { return }
+
+            # Повторять имеет смысл ТОЛЬКО сетевую ошибку. Ошибку в самом установщике двадцать
+            # повторов лишь спрячут за ложным «связь оборвалась», и человек полезет чинить
+            # интернет, с которым всё в порядке.
+            if ($_.Exception -isnot [Net.WebException]) { throw }
+
             Say ''
             Say "    связь оборвалась на $(Size $now) — продолжаю с этого места (попытка $attempt)" 'DarkYellow'
             Start-Sleep -Seconds 3
