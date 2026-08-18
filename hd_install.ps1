@@ -56,6 +56,15 @@ function ReadLines($path) {
     @([IO.File]::ReadAllText($path) -split "`r?`n" | ForEach-Object { $_.Trim([char]0xFEFF).Trim() } | Where-Object { $_ })
 }
 
+function Speed($bps) {
+    if ($bps -ge 1048576) { '{0:n1} МБ/с' -f ($bps / 1048576) }
+    else                  { '{0:n0} КБ/с' -f ($bps / 1024) }
+}
+function Left($sec) {
+    if ($sec -ge 3600) { '{0:n0} ч {1:n0} мин' -f [math]::Floor($sec/3600), (($sec % 3600)/60) }
+    elseif ($sec -ge 60) { '{0:n0} мин' -f [math]::Ceiling($sec/60) }
+    else { '{0:n0} сек' -f $sec }
+}
 function Size($bytes) {
     if ($bytes -ge 1073741824) { '{0:n2} ГБ' -f ($bytes / 1073741824) }
     else                       { '{0:n0} МБ' -f ($bytes / 1048576) }
@@ -348,22 +357,34 @@ function Get-Part($url, $dest, $expectSize) {
             $fmode = if ($have -gt 0) { [IO.FileMode]::Append } else { [IO.FileMode]::Create }
             $in  = $resp.GetResponseStream()
             $out = New-Object IO.FileStream($dest, $fmode, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $started   = Get-Date
+            $fromStart = [int64]$have
             try {
                 $buf  = New-Object byte[] 262144
                 $done = [int64]$have
-                $tick = 0
+                # ⛔ Полоса рисовалась раз в N прочитанных кусков — то есть раз в 10 МБ. На канале
+                # в 60 КБ/с это три минуты пустого экрана, и человек решает, что всё повисло.
+                # Считать надо ВРЕМЯ, а не байты: на быстром канале строка не мельтешит,
+                # на медленном всё равно обновляется. Первую строку рисуем сразу.
+                $lastDraw = (Get-Date).AddSeconds(-10)
                 while (($n = $in.Read($buf, 0, $buf.Length)) -gt 0) {
                     $out.Write($buf, 0, $n)
                     $done += $n
-                    $tick++
-                    if ($tick % 40 -eq 0) {
-                        Write-Host ("`r    {0,3:n0}%  {1}   " -f (($done * 100) / $expectSize), (Size $done)) -NoNewline
+                    $now = Get-Date
+                    if (($now - $lastDraw).TotalMilliseconds -ge 400) {
+                        $lastDraw = $now
+                        $sec   = ($now - $started).TotalSeconds
+                        $speed = if ($sec -gt 0) { ($done - $fromStart) / $sec } else { 0 }
+                        $left  = if ($speed -gt 0) { [int](($expectSize - $done) / $speed) } else { 0 }
+                        $line = '    {0,3:n0}%  {1} из {2}   {3}   осталось ~{4}' -f `
+                            (($done * 100) / $expectSize), (Size $done), (Size $expectSize), (Speed $speed), (Left $left)
+                        Write-Host ("`r" + $line.PadRight(66)) -NoNewline
                     }
                 }
             } finally {
                 $out.Close(); $in.Close(); $resp.Close()
             }
-            Write-Host ("`r    100%  {0}      " -f (Size $expectSize))
+            Write-Host ("`r" + ('    готово: ' + (Size $expectSize)).PadRight(66))
         } catch {
             $now = 0
             if (Test-Path $dest) { $now = (Get-Item $dest).Length }
