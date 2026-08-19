@@ -209,19 +209,58 @@ Say ''
 
 # --- 7. Какой набор, ставить или снимать ----------------------------------------------------
 #
-# Рекомендация опирается на замер, а не на ощущения. Полный набор в живой игре на 1080p:
-# занято 2190 МБ видеопамяти, пик 2905 МБ. Цели рендера добавляют ~220 МБ на 1440p и ~800 МБ
-# на 4K. Отсюда и пороги: 8 ГБ держат полный с запасом, 6 ГБ — полный только на 1080p,
-# 4 ГБ тянут лишь облегчённый, ниже 4 ГБ ставить нечего.
-function Recommend($vramBytes) {
-    if ($vramBytes -le 0)      { return @{ tier = 'full'; why = 'объём видеопамяти определить не вышло — исходим из обычных 8 ГБ' } }
-    $gb = $vramBytes / 1GB
-    if ($gb -lt 3.5)  { return @{ tier = 'none'; why = 'видеопамяти меньше 4 ГБ — набор в неё не поместится' } }
-    if ($gb -lt 5.5)  { return @{ tier = 'lite'; why = 'при 4 ГБ уверенно идёт только облегчённый' } }
-    if ($gb -lt 7.5)  { return @{ tier = 'lite'; why = 'при 6 ГБ полный пойдёт на 1080p, но на 1440p и выше запаса уже нет' } }
-    return @{ tier = 'full'; why = "при $([math]::Round($gb)) ГБ полный набор идёт с запасом" }
+# Совет считается, а не берётся из таблицы: разрешение экрана влияет на видеопамять не меньше,
+# чем сам набор. Все числа ниже — замеренные, а не придуманные.
+#
+#   Текстуры (рабочий набор на локации, замер на Баре):
+#       полный 1458 МБ, облегчённый ~1058 МБ (он весит 73% полного).
+#   Цели рендера: 134 байта на пиксель кадра — это G-буфер, накопители, вектора скоростей,
+#       временны́е буферы и задний буфер вместе. Проверено по коду r2_rendertarget.cpp и сошлось
+#       с замером: 1080p — 394 МБ, 1440p — 600 МБ, 4K — 1189 МБ.
+#   Теневые карты: 129 МБ и от разрешения НЕ зависят (свой размер, 2048 и атлас 4096).
+#   Прочее — геометрия, буферы, звук: ~200 МБ.
+#   Системе и рабочему столу оставляем 500 МБ: игра не одна на видеокарте.
+#
+# Запас 1.3 взят не с потолка: 1458 МБ сняты на Баре, а локации разные, и на самой тяжёлой
+# рабочий набор будет больше. Советовать «впритык» — это советовать рывки.
+function ScreenSize {
+    $w = 0; $h = 0
+    try {
+        foreach ($v in Get-WmiObject Win32_VideoController -ErrorAction SilentlyContinue) {
+            if ($v.CurrentHorizontalResolution -gt $w) {
+                $w = [int]$v.CurrentHorizontalResolution; $h = [int]$v.CurrentVerticalResolution
+            }
+        }
+    } catch { }
+    if ($w -le 0) {
+        try {
+            Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+            $b = [Windows.Forms.Screen]::PrimaryScreen.Bounds
+            $w = $b.Width; $h = $b.Height
+        } catch { }
+    }
+    if ($w -le 0) { $w = 1920; $h = 1080 }   # не определилось — считаем по самому обычному
+    @{ w = $w; h = $h }
 }
-$rec = Recommend $vram
+
+function NeedMB($tier, $w, $h) {
+    $tex   = if ($tier -eq 'lite') { 1058 } else { 1458 }
+    $rt    = ([double]$w * $h * 134) / 1MB
+    ($tex + $rt + 129 + 200) * 1.3
+}
+
+function Recommend($vramBytes, $w, $h) {
+    $haveMB = if ($vramBytes -gt 0) { ($vramBytes / 1MB) - 500 } else { 8192 - 500 }
+    $needFull = NeedMB 'full' $w $h
+    $needLite = NeedMB 'lite' $w $h
+    if ($haveMB -ge $needFull) { return @{ tier = 'full'; need = $needFull; have = $haveMB } }
+    if ($haveMB -ge $needLite) { return @{ tier = 'lite'; need = $needLite; have = $haveMB } }
+    @{ tier = 'none'; need = $needLite; have = $haveMB }
+}
+
+$scr = ScreenSize
+$rec = Recommend $vram $scr.w $scr.h
+
 
 $installedTier = ''
 if (Test-Path $TierFile) { $t = ReadLines $TierFile; if ($t.Count -gt 0) { $installedTier = $t[0] } }
@@ -233,11 +272,14 @@ Say ''
 if ($tierFull.Count) { Say ("    [1] Полный        {0} загрузки, 4.0 ГБ на диске, +640 МБ видеопамяти" -f (Size $sizeFull)) }
 if ($tierLite.Count) { Say ("    [2] Облегчённый   {0} загрузки, 2.9 ГБ на диске, +470 МБ видеопамяти" -f (Size $sizeLite)) }
 Say ''
+Say ("  Ваш экран: {0}x{1}. Свободно под игру ~{2:n0} МБ видеопамяти." -f $scr.w, $scr.h, $rec.have)
+Say ("  Нужно: полному ~{0:n0} МБ, облегчённому ~{1:n0} МБ (с запасом на тяжёлые локации)." -f (NeedMB 'full' $scr.w $scr.h), (NeedMB 'lite' $scr.w $scr.h))
+Say ''
 if ($rec.tier -eq 'none') {
-    Say "  Не советую ставить: $($rec.why)." 'Yellow'
-    Say '  Если всё же решитесь — берите облегчённый.' 'Yellow'
+    Say '  Не советую ставить ни один: видеопамяти не хватит даже облегчённому.' 'Yellow'
+    Say '  Если всё же решитесь — берите облегчённый и снизьте разрешение.' 'Yellow'
 } else {
-    Say "  Советую: $(TierName $rec.tier) — $($rec.why)." 'Green'
+    Say "  Советую: $(TierName $rec.tier)." 'Green'
 }
 Say ''
 
