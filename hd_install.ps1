@@ -52,8 +52,12 @@ function AppendText($path, $line) {
     [IO.File]::WriteAllText($path, $prev + $line + "`r`n", $Utf8NoBom)
 }
 function ReadLines($path) {
-    if (-not (Test-Path $path)) { return @() }
-    @([IO.File]::ReadAllText($path) -split "`r?`n" | ForEach-Object { $_.Trim([char]0xFEFF).Trim() } | Where-Object { $_ })
+    # ⚠️ Запятая перед @() обязательна. PowerShell при возврате из функции РАЗВОРАЧИВАЕТ массив
+    # из одного элемента в скаляр: файл с одной строкой возвращался строкой, и $x[0] брал
+    # первый СИМВОЛ вместо первой строки — из «lite» выходило «l», из «two-k-2.0.2» — «t».
+    # Сравнение версий при этом всегда сообщало, что в выпуске новее.
+    if (-not (Test-Path $path)) { return ,@() }
+    ,@([IO.File]::ReadAllText($path) -split "`r?`n" | ForEach-Object { $_.Trim([char]0xFEFF).Trim() } | Where-Object { $_ })
 }
 
 function Speed($bps) {
@@ -80,6 +84,7 @@ $AppData   = Join-Path $Root 'appdata'
 $StampFile = Join-Path $AppData 'da_hd_version.txt'
 $PartsFile = Join-Path $AppData 'da_hd_parts.txt'
 $FilesFile = Join-Path $AppData 'da_hd_files.txt'
+$TierFile  = Join-Path $AppData 'da_hd_tier.txt'
 $BackupDir = Join-Path $AppData 'da_hd_backup'
 $OurFiles  = Join-Path $AppData 'da_x64_files.txt'   # манифест самой сборки x64
 
@@ -183,44 +188,107 @@ try {
 }
 
 $tag    = $rel.tag_name
-$assets = @($rel.assets | Where-Object { $_.name -like 'DeadAir-x64-HD-*of*.tar.xz' } | Sort-Object name)
+# Наборы различаются по имени вложения: у облегчённого в имени стоит «lite», у полного нет.
+# Имена асимметричны намеренно — полный уже выложен под прежними именами, и переливать
+# ради красоты 2.7 ГБ было бы неуважением к тому, кто платит за трафик.
+$allParts = @($rel.assets | Where-Object { $_.name -like 'DeadAir-x64-HD-*of*.tar.xz' })
+$tierFull = @($allParts | Where-Object { $_.name -notlike '*-lite-*' } | Sort-Object name)
+$tierLite = @($allParts | Where-Object { $_.name -like  '*-lite-*' } | Sort-Object name)
+$assets = $tierFull
 $sumsAsset = $rel.assets | Where-Object { $_.name -eq 'SHA256SUMS.txt' } | Select-Object -First 1
 $listAsset = $rel.assets | Where-Object { $_.name -eq 'FILES.txt' }      | Select-Object -First 1
 
-if ($assets.Count -eq 0) { Fail "В выпуске $tag нет частей набора. Похоже, выкладка ещё идёт — попробуйте позже." }
+if ($tierFull.Count -eq 0 -and $tierLite.Count -eq 0) { Fail "В выпуске $tag нет частей набора. Похоже, выкладка ещё идёт — попробуйте позже." }
 if (-not $sumsAsset)     { Fail "В выпуске $tag нет SHA256SUMS.txt — без него проверить загрузку нечем." }
 if (-not $listAsset)     { Fail "В выпуске $tag нет FILES.txt — без него набор нельзя будет снять." }
 
-$total = ($assets | Measure-Object -Property size -Sum).Sum
-Say "  Выпуск: $tag — $($assets.Count) частей, $(Size $total)"
+$sizeFull = ($tierFull | Measure-Object -Property size -Sum).Sum
+$sizeLite = ($tierLite | Measure-Object -Property size -Sum).Sum
+Say "  Выпуск: $tag"
 Say ''
 
-# --- 7. Ставить, снимать или выйти ----------------------------------------------------------
+# --- 7. Какой набор, ставить или снимать ----------------------------------------------------
+#
+# Рекомендация опирается на замер, а не на ощущения. Полный набор в живой игре на 1080p:
+# занято 2190 МБ видеопамяти, пик 2905 МБ. Цели рендера добавляют ~220 МБ на 1440p и ~800 МБ
+# на 4K. Отсюда и пороги: 8 ГБ держат полный с запасом, 6 ГБ — полный только на 1080p,
+# 4 ГБ тянут лишь облегчённый, ниже 4 ГБ ставить нечего.
+function Recommend($vramBytes) {
+    if ($vramBytes -le 0)      { return @{ tier = 'full'; why = 'объём видеопамяти определить не вышло — исходим из обычных 8 ГБ' } }
+    $gb = $vramBytes / 1GB
+    if ($gb -lt 3.5)  { return @{ tier = 'none'; why = 'видеопамяти меньше 4 ГБ — набор в неё не поместится' } }
+    if ($gb -lt 5.5)  { return @{ tier = 'lite'; why = 'при 4 ГБ уверенно идёт только облегчённый' } }
+    if ($gb -lt 7.5)  { return @{ tier = 'lite'; why = 'при 6 ГБ полный пойдёт на 1080p, но на 1440p и выше запаса уже нет' } }
+    return @{ tier = 'full'; why = "при $([math]::Round($gb)) ГБ полный набор идёт с запасом" }
+}
+$rec = Recommend $vram
+
+$installedTier = ''
+if (Test-Path $TierFile) { $t = ReadLines $TierFile; if ($t.Count -gt 0) { $installedTier = $t[0] } }
+function TierName($t) { if ($t -eq 'lite') { 'облегчённый' } elseif ($t -eq 'full') { 'полный' } else { $t } }
+
+Say '  Наборов два. Отличаются они не «вдвое», а на четверть: из 1553 текстур'
+Say '  в облегчённом уменьшены 234, остальные те же самые.'
+Say ''
+if ($tierFull.Count) { Say ("    [1] Полный        {0} загрузки, 4.0 ГБ на диске, +640 МБ видеопамяти" -f (Size $sizeFull)) }
+if ($tierLite.Count) { Say ("    [2] Облегчённый   {0} загрузки, 2.9 ГБ на диске, +470 МБ видеопамяти" -f (Size $sizeLite)) }
+Say ''
+if ($rec.tier -eq 'none') {
+    Say "  Не советую ставить: $($rec.why)." 'Yellow'
+    Say '  Если всё же решитесь — берите облегчённый.' 'Yellow'
+} else {
+    Say "  Советую: $(TierName $rec.tier) — $($rec.why)." 'Green'
+}
+Say ''
+
 $mode = 'install'
+$want = $rec.tier
+if ($want -eq 'none') { $want = 'lite' }
+
 if ($installed) {
-    if ($installed -eq $tag) {
-        Say "  Набор уже стоит, версия та же ($tag)." 'Green'
-    } else {
-        Say "  Стоит версия $installed, доступна $tag." 'Yellow'
-    }
+    Say ("  Уже стоит: {0} набор, версия {1}." -f (TierName $installedTier), $installed) 'DarkGray'
+    if ($installed -eq $tag) { Say '  Версия та же, что в выпуске.' 'DarkGray' }
+    else { Say "  В выпуске новее: $tag." 'Yellow' }
     Say ''
-    Say '    1 — переустановить набор'
-    Say '    2 — снять набор и вернуть как было'
-    Say '    3 — выйти'
+    Say '    1 — поставить полный'
+    Say '    2 — поставить облегчённый'
+    Say '    3 — снять набор и вернуть как было'
+    Say '    4 — выйти'
     Say ''
-    $choice = Read-Host '  Что делать'
-    switch ($choice) {
-        '1' { $mode = 'install' }
-        '2' { $mode = 'remove' }
+    switch (Read-Host '  Что делать') {
+        '1' { $mode = 'install'; $want = 'full' }
+        '2' { $mode = 'install'; $want = 'lite' }
+        '3' { $mode = 'remove' }
         default { Say ''; Say '  Ничего не делаю.'; exit 0 }
     }
 } else {
-    Say '  Набор ещё не стоит.'
+    Say '    1 — поставить полный'
+    Say '    2 — поставить облегчённый'
+    Say '    3 — выйти'
     Say ''
-    Say "  Будет скачано $(Size $total), после распаковки на диске 4.0 ГБ."
+    $d = if ($rec.tier -eq 'full') { '1' } else { '2' }
+    $c = Read-Host "  Что делать (Enter — как советую, $d)"
+    if (-not $c) { $c = $d }
+    switch ($c) {
+        '1' { $want = 'full' }
+        '2' { $want = 'lite' }
+        default { Say ''; Say '  Ничего не делаю.'; exit 0 }
+    }
+}
+
+if ($mode -eq 'install') {
+    $assets = if ($want -eq 'lite') { $tierLite } else { $tierFull }
+    if ($assets.Count -eq 0) { Fail "В выпуске $tag нет частей для варианта «$(TierName $want)»." }
+    # Смена набора на другой — это сначала полное снятие прежнего: файлы одноимённые,
+    # и распаковка поверх дала бы смесь из двух наборов, которую потом не разделить.
+    if ($installed -and $installedTier -and $installedTier -ne $want) {
+        Say ''
+        Say "  Сначала сниму $(TierName $installedTier), потом поставлю $(TierName $want)." 'DarkGray'
+        $mode = 'switch'
+    }
+    $total = ($assets | Measure-Object -Property size -Sum).Sum
     Say ''
-    $choice = Read-Host '  Ставить? (д/н)'
-    if ($choice -notmatch '^[дdyтy]') { Say ''; Say '  Ничего не делаю.'; exit 0 }
+    Say ("  Ставлю {0} набор: {1} частей, {2}." -f (TierName $want), $assets.Count, (Size $total))
 }
 
 if (-not (Test-Path $AppData)) { New-Item -ItemType Directory -Path $AppData -Force | Out-Null }
@@ -229,7 +297,7 @@ if (-not (Test-Path $AppData)) { New-Item -ItemType Directory -Path $AppData -Fo
 # Удаляем ровно то, что сами поставили, и ни файлом больше. Перечень взят не из выпуска, а из
 # da_hd_files.txt, записанного при установке: если на GitHub с тех пор вышла другая версия
 # набора с другим составом, перечень из неё удалил бы не то и оставил бы хвосты.
-if ($mode -eq 'remove') {
+if ($mode -eq 'remove' -or $mode -eq 'switch') {
     if (-not (Test-Path $FilesFile)) {
         Fail @"
 Нет перечня установленных файлов ($FilesFile).
@@ -272,13 +340,21 @@ if ($mode -eq 'remove') {
             }
     }
 
-    Remove-Item $StampFile, $PartsFile, $FilesFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $StampFile, $PartsFile, $FilesFile, $TierFile -Force -ErrorAction SilentlyContinue
     Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
-    Say ''
-    Say '  Набор снят, всё вернулось как было.' 'Green'
-    Say ''
-    Read-Host 'Enter — выход'
-    exit 0
+
+    if ($mode -eq 'switch') {
+        # Прежние отметки стёрты — иначе цикл ниже счёл бы части уже поставленными
+        # и пропустил бы их, оставив набор наполовину снятым.
+        $installed = ''; $installedTier = ''
+        Say '  Прежний набор снят, ставлю выбранный.' 'DarkGray'
+    } else {
+        Say ''
+        Say '  Набор снят, всё вернулось как было.' 'Green'
+        Say ''
+        Read-Host 'Enter — выход'
+        exit 0
+    }
 }
 
 # --- УСТАНОВКА ------------------------------------------------------------------------------
@@ -436,10 +512,12 @@ foreach ($a in $assets) {
     # Проверка суммы. Битая часть — это не «наверное, обойдётся»: половина текстур в наборе
     # прочитается, а на второй половине игра свалится в загрузке, и виноват будет якобы движок.
     Say '    проверяю целостность...'
-    $want = $sums[$a.name]
-    if (-not $want) { Fail "В SHA256SUMS.txt нет строки для $($a.name)." }
+    # ⚠️ Переменная НЕ должна называться $want: так зовётся выбранный набор, и присваивание
+    # здесь затирало его отпечатком — в отметку и в итоговое сообщение уезжал SHA-256.
+    $wantHash = $sums[$a.name]
+    if (-not $wantHash) { Fail "В SHA256SUMS.txt нет строки для $($a.name)." }
     $got = (Get-FileHash $dest -Algorithm SHA256).Hash.ToLower()
-    if ($got -ne $want) {
+    if ($got -ne $wantHash) {
         Remove-Item $dest -Force -ErrorAction SilentlyContinue
         Fail @"
 Часть $($a.name) скачалась повреждённой.
@@ -493,11 +571,12 @@ foreach ($a in $assets) {
 # --- Отметки --------------------------------------------------------------------------------
 WriteText $FilesFile ($packFiles -join "`r`n")
 WriteText $StampFile $tag
+WriteText $TierFile $want
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
 
 Say ''
 Say '  ------------------------------------------' 'Cyan'
-Say "  HD-текстуры поставлены. Версия набора: $tag" 'Green'
+Say ("  Поставлен {0} набор, версия {1}." -f (TierName $want), $tag) 'Green'
 Say ''
 Say '  Набор снимается этим же скриптом: запустите его снова'
 Say '  и выберите «снять набор».'
