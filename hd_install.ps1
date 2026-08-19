@@ -192,6 +192,15 @@ $tag    = $rel.tag_name
 # Имена асимметричны намеренно — полный уже выложен под прежними именами, и переливать
 # ради красоты 2.7 ГБ было бы неуважением к тому, кто платит за трафик.
 $allParts = @($rel.assets | Where-Object { $_.name -like 'DeadAir-x64-HD-*of*.tar.xz' })
+
+# [DA_PORT] Растительность - отдельное вложение, ставится при ЛЮБОМ наборе.
+#
+# Деревья Absolute Nature 4 (Cromm Cruac) и наша кора: 45 МБ загрузки против 2.68 ГБ полного
+# набора, а видно их в каждом кадре под открытым небом. Делить такую мелочь на «полный» и
+# «облегчённый» смысла нет. Отдельной частью, а не внутри - чтобы переставить или снять её
+# можно было, не трогая гигабайты.
+$vegAsset = $rel.assets | Where-Object { $_.name -eq 'DeadAir-x64-HD-veg.tar.xz' } | Select-Object -First 1
+
 $tierFull = @($allParts | Where-Object { $_.name -notlike '*-lite-*' } | Sort-Object name)
 $tierLite = @($allParts | Where-Object { $_.name -like  '*-lite-*' } | Sort-Object name)
 $assets = $tierFull
@@ -364,9 +373,11 @@ if ($mode -eq 'install') {
         Say "  Сначала сниму $(TierName $installedTier), потом поставлю $(TierName $want)." 'DarkGray'
         $mode = 'switch'
     }
+    if ($vegAsset) { $assets = @($assets) + @($vegAsset) }
     $total = ($assets | Measure-Object -Property size -Sum).Sum
     Say ''
     Say ("  Ставлю {0} набор: {1} частей, {2}." -f (TierName $want), $assets.Count, (Size $total))
+    if ($vegAsset) { Say ("  Плюс растительность: деревья и кора, {0}." -f (Size $vegAsset.size)) 'DarkGray' }
 }
 
 if (-not (Test-Path $AppData)) { New-Item -ItemType Directory -Path $AppData -Force | Out-Null }
@@ -563,6 +574,9 @@ if (Test-Path $FilesFile) {
     foreach ($t in ReadLines $FilesFile) { $prevOwned[$t.ToLower().Replace('/', '\')] = $true }
 }
 
+# Всё, что распаковали за этот запуск — для перечня снятия. Накапливаем в цикле, пока архивы целы.
+$installedFiles = New-Object System.Collections.Generic.List[string]
+
 # Какие части уже поставлены.
 $done = @{}
 if (Test-Path $PartsFile) {
@@ -607,6 +621,7 @@ foreach ($a in $assets) {
     # Что эта часть перекроет — уносим в резерв. Именно ДО распаковки: после неё оригинала
     # уже нет, и вернуть при снятии будет нечего.
     $inPart = @(& $Tar -tf $dest 2>$null | Where-Object { $_ -and $_ -notmatch '/$' })
+    foreach ($f in $inPart) { $installedFiles.Add($f) | Out-Null }
     $saved = 0
     foreach ($f in $inPart) {
         $rel_path = $f.Replace('/', '\')
@@ -647,7 +662,13 @@ foreach ($a in $assets) {
 }
 
 # --- Отметки --------------------------------------------------------------------------------
-WriteText $FilesFile ($packFiles -join "`r`n")
+# [DA_PORT] Перечень для снятия = FILES.txt выпуска ПЛЮС всё, что реально распаковано.
+#
+# 🪤 Первая версия перечисляла архив растительности здесь, в конце. Не сработало бы: части
+# удаляются сразу после распаковки, и к этому моменту файла уже нет. Копим по ходу, в цикле,
+# где архив ещё на диске.
+$extracted = @($installedFiles | ForEach-Object { $_.Replace('/', '') })
+WriteText $FilesFile ((@($packFiles) + $extracted | Select-Object -Unique) -join "`r`n")
 WriteText $StampFile $tag
 WriteText $TierFile $want
 Remove-Item $Work -Recurse -Force -ErrorAction SilentlyContinue
