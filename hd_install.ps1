@@ -207,6 +207,36 @@ $sizeLite = ($tierLite | Measure-Object -Property size -Sum).Sum
 Say "  Выпуск: $tag"
 Say ''
 
+# --- КАКОЙ НАБОР СТОИТ -----------------------------------------------------------------------
+# Установщики до 19.08.26 отметку набора не писали, и у поставивших тогда в меню было пусто:
+# «Уже стоит:  набор». Определяем по самим файлам — берём текстуры, которые в наборах заведомо
+# разного размера, и читаем разрешение прямо из заголовка DDS (ширина и высота лежат
+# по смещениям 16 и 12). Двух проб хватает: если одна не найдётся, ответит вторая.
+function DetectTier {
+    $probes = @(
+        @{ path = 'gamedata/textures/detail/detail_grnd_asphalt.dds'; full = 8192; lite = 4096 },
+        @{ path = 'gamedata/textures/ston/ston_briks_ch.dds';         full = 4096; lite = 2048 }
+    )
+    foreach ($pr in $probes) {
+        $f = Join-Path $Root $pr.path
+        if (-not (Test-Path $f)) { continue }
+        try {
+            $fs = [IO.File]::OpenRead($f)
+            try {
+                $b = New-Object byte[] 20
+                if ($fs.Read($b, 0, 20) -lt 20) { continue }
+                if ($b[0] -ne 68 -or $b[1] -ne 68 -or $b[2] -ne 83) { continue }   # "DDS "
+                $h = [BitConverter]::ToUInt32($b, 12)
+                $w = [BitConverter]::ToUInt32($b, 16)
+            } finally { $fs.Close() }
+        } catch { continue }
+        $side = [Math]::Max($w, $h)
+        if ($side -eq $pr.full) { return 'full' }
+        if ($side -eq $pr.lite) { return 'lite' }
+    }
+    ''
+}
+
 # --- 7. Какой набор, ставить или снимать ----------------------------------------------------
 #
 # Совет считается, а не берётся из таблицы: разрешение экрана влияет на видеопамять не меньше,
@@ -264,7 +294,13 @@ $rec = Recommend $vram $scr.w $scr.h
 
 $installedTier = ''
 if (Test-Path $TierFile) { $t = ReadLines $TierFile; if ($t.Count -gt 0) { $installedTier = $t[0] } }
-function TierName($t) { if ($t -eq 'lite') { 'облегчённый' } elseif ($t -eq 'full') { 'полный' } else { $t } }
+if (-not $installedTier -and $installed) {
+    # Отметки нет — значит ставил прежний установщик. Определяем и СРАЗУ записываем,
+    # чтобы в следующий раз не гадать.
+    $installedTier = DetectTier
+    if ($installedTier) { try { WriteText $TierFile $installedTier } catch { } }
+}
+function TierName($t) { if ($t -eq 'lite') { 'облегчённый' } elseif ($t -eq 'full') { 'полный' } else { 'неопознанный' } }
 
 Say '  Наборов два. Отличаются они не «вдвое», а на четверть: из 1553 текстур'
 Say '  в облегчённом уменьшены 234, остальные те же самые.'
