@@ -173,11 +173,47 @@ $installed = ''
 $stampLines = ReadLines $StampFile
 if ($stampLines.Count -gt 0) { $installed = $stampLines[0] }
 
+# --- КОРОТКИЙ ТЕКСТОВЫЙ ФАЙЛ ИЗ ВЫПУСКА ------------------------------------------------------
+# ⛔ Здесь стоял Net.WebClient.DownloadString, которому таймаут задать НЕЧЕМ. Когда провайдер
+# режет адрес по DPI, соединение не отвергается, а виснет — установщик замирал навсегда.
+# Ровно на этом вставал установщик движка: тот же вызов, та же причина.
+#
+# Сначала пробуем адрес выпуска, затем тот же файл через api.github.com. Этот адрес установщик
+# уже успешно опросил выше, значит он доступен, а objects.githubusercontent режут чаще.
+#
+# ⚠️ Accept и User-Agent — ограниченные заголовки: через .Headers они БРОСАЮТ исключение,
+# и ошибка кода прикидывается обрывом связи. Ставятся только свойствами.
+function Get-Text($asset, $ua, $timeoutMs = 20000) {
+    $tries = @(
+        @{ u = $asset.browser_download_url; a = $null },
+        @{ u = "https://api.github.com/repos/$Owner/$Repo/releases/assets/$($asset.id)"
+           a = 'application/octet-stream' }
+    )
+    $last = ''
+    foreach ($t in $tries) {
+        if (-not $t.u) { continue }
+        try {
+            $req = [Net.HttpWebRequest]::Create($t.u)
+            $req.UserAgent = $ua
+            if ($t.a) { $req.Accept = $t.a }
+            $req.Timeout = $timeoutMs
+            $req.ReadWriteTimeout = $timeoutMs
+            $resp = $req.GetResponse()
+            try {
+                $sr = New-Object IO.StreamReader($resp.GetResponseStream())
+                return $sr.ReadToEnd()
+            } finally { $resp.Close() }
+        } catch { $last = $_.Exception.Message }
+    }
+    throw "ни по адресу выпуска, ни через api.github.com. $last"
+}
+
 # --- 6. Какой выпуск на GitHub --------------------------------------------------------------
 Say '  Смотрю, что выложено...'
 $api = "https://api.github.com/repos/$Owner/$Repo/releases/latest"
 try {
-    $rel = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'DeadAir-x64-HD' }
+    # Без -TimeoutSec запрос может висеть неограниченно долго — как и было.
+    $rel = Invoke-RestMethod -Uri $api -Headers @{ 'User-Agent' = 'DeadAir-x64-HD' } -TimeoutSec 30
 } catch {
     Fail @"
 Не удалось связаться с GitHub: $($_.Exception.Message)
@@ -458,7 +494,7 @@ if ($installed -and $installed -ne $tag) {
 Say '  Беру контрольные суммы...'
 $sums = @{}
 try {
-    $raw = (New-Object Net.WebClient).DownloadString($sumsAsset.browser_download_url)
+    $raw = Get-Text $sumsAsset 'DeadAir-x64-HD'
     foreach ($line in $raw -split "`n") {
         if ($line -match '^([0-9a-fA-F]{64})\s+\*?(.+?)\s*$') { $sums[$matches[2]] = $matches[1].ToLower() }
     }
@@ -469,7 +505,7 @@ try {
 # Перечень файлов набора — понадобится и сейчас (найти перекрытия), и потом (для снятия).
 Say '  Беру перечень файлов...'
 try {
-    $packFiles = @((New-Object Net.WebClient).DownloadString($listAsset.browser_download_url) -split "`r?`n" | Where-Object { $_.Trim() })
+    $packFiles = @((Get-Text $listAsset 'DeadAir-x64-HD') -split "`r?`n" | Where-Object { $_.Trim() })
 } catch {
     Fail "Не удалось скачать FILES.txt: $($_.Exception.Message)"
 }
